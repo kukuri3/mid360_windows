@@ -1,7 +1,7 @@
 """
-Point cloud UDP receiver for MID-360 (port 56300).
+Point cloud UDP receiver for MID-360 (port 56301 on host side).
 
-Runs in a background thread, parses incoming frames,
+Runs in a background thread, parses incoming 36-byte header + point data,
 and stores the latest point cloud in a thread-safe buffer.
 """
 
@@ -24,7 +24,7 @@ RECV_BUF_SIZE = 65535
 class PointCloudReceiver:
     """Receives and buffers point cloud data from MID-360."""
 
-    def __init__(self, host_ip: str, port: int = proto.PORT_POINTCLOUD):
+    def __init__(self, host_ip: str, port: int = proto.PORT_HOST_POINTCLOUD):
         self.host_ip = host_ip
         self.port = port
 
@@ -33,17 +33,15 @@ class PointCloudReceiver:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
-        # Latest accumulated point cloud (reset each display cycle)
-        self._points: Optional[np.ndarray] = None  # Nx3 float64 (meters)
-        self._reflectivity: Optional[np.ndarray] = None  # N uint8
+        # Accumulation buffer — collects points between get_points() calls
+        self._accum_points: list = []
+        self._accum_ref: list = []
+
+        # Stats
         self._frame_count = 0
         self._point_count = 0
         self._last_fps_time = time.time()
         self._fps = 0.0
-
-        # Accumulation buffer — collects points between get_points() calls
-        self._accum_points: list = []
-        self._accum_ref: list = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -116,21 +114,16 @@ class PointCloudReceiver:
                     break
                 continue
 
-            frame = proto.parse_pointcloud_header(data)
-            if frame is None:
+            pkt = proto.parse_pointcloud_packet(data)
+            if pkt is None:
                 continue
 
-            # Only handle cartesian type (data_type == 1)
-            if frame.data_type not in (1, 2):
-                # type 1 = cartesian, type 2 = spherical (skip others)
-                if frame.data_type == 1:
-                    pass  # handled below
+            # Parse points based on data_type
+            if pkt.data_type not in (1, 2, 3):
                 continue
 
-            if frame.data_type == 1:
-                xyz, ref = proto.parse_cartesian_points_numpy(frame.raw_points)
-            else:
-                continue
+            xyz, ref = proto.parse_points_numpy(
+                pkt.raw_points, pkt.data_type, pkt.dot_num)
 
             if xyz.shape[0] == 0:
                 continue

@@ -2,10 +2,11 @@
 MID-360 device connection manager.
 
 Handles:
-  - IP scanning (ping-like probe via UDP on command port)
-  - Handshake
-  - Heartbeat keep-alive
-  - Sampling start / stop
+  - Device discovery via broadcast (port 56000)
+  - IP scanning (probe range of IPs)
+  - Handshake (register host IP/ports via key-value config)
+  - Keep-alive via periodic discovery broadcast
+  - Sampling start / stop (work mode control)
 """
 
 import socket
@@ -19,8 +20,8 @@ from . import protocol as proto
 
 logger = logging.getLogger(__name__)
 
-# Heartbeat interval (seconds) — must be < 3 s or device disconnects
-HEARTBEAT_INTERVAL = 1.0
+# Discovery broadcast interval (seconds) — also serves as keep-alive
+DISCOVERY_INTERVAL = 1.0
 # Timeout for waiting command responses
 CMD_TIMEOUT = 1.0
 # Timeout for IP scan probe
@@ -30,16 +31,14 @@ SCAN_TIMEOUT = 0.3
 class MID360Connection:
     """Manages the UDP command channel to a single MID-360."""
 
-    def __init__(self, sensor_ip: str, host_ip: str,
-                 cmd_port: int = proto.PORT_COMMAND):
+    def __init__(self, sensor_ip: str, host_ip: str):
         self.sensor_ip = sensor_ip
         self.host_ip = host_ip
-        self.cmd_port = cmd_port
 
         self._seq = 0
-        self._sock: Optional[socket.socket] = None
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._heartbeat_stop = threading.Event()
+        self._cmd_sock: Optional[socket.socket] = None
+        self._discovery_thread: Optional[threading.Thread] = None
+        self._discovery_stop = threading.Event()
         self._connected = False
         self._lock = threading.Lock()
 
@@ -52,20 +51,20 @@ class MID360Connection:
         return self._connected
 
     def connect(self) -> bool:
-        """Perform handshake with the sensor."""
+        """Perform handshake (config write) with the sensor."""
         try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._sock.settimeout(CMD_TIMEOUT)
-            # Bind to any available port on host
-            self._sock.bind((self.host_ip, 0))
+            self._cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._cmd_sock.settimeout(CMD_TIMEOUT)
+            self._cmd_sock.bind((self.host_ip, proto.PORT_HOST_CMD))
 
-            # Send handshake
+            # Send handshake (register host IP/ports)
             if not self._handshake():
                 self.disconnect()
                 return False
 
             self._connected = True
-            self._start_heartbeat()
+            # Start periodic discovery as keep-alive
+            self._start_discovery_keepalive()
             logger.info("Connected to MID-360 at %s", self.sensor_ip)
             return True
         except Exception:
@@ -74,26 +73,26 @@ class MID360Connection:
             return False
 
     def disconnect(self):
-        """Stop heartbeat and close socket."""
+        """Stop keep-alive and close sockets."""
         self._connected = False
-        self._heartbeat_stop.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=3)
-        if self._sock:
+        self._discovery_stop.set()
+        if self._discovery_thread and self._discovery_thread.is_alive():
+            self._discovery_thread.join(timeout=3)
+        if self._cmd_sock:
             try:
-                self._sock.close()
+                self._cmd_sock.close()
             except Exception:
                 pass
-            self._sock = None
+            self._cmd_sock = None
         logger.info("Disconnected from MID-360")
 
     def start_sampling(self) -> bool:
-        """Send sampling-start command (sample_ctrl = 1)."""
-        return self._sampling_ctrl(1)
+        """Set work mode to Normal (start point cloud streaming)."""
+        return self._set_work_mode(proto.WorkMode.NORMAL)
 
     def stop_sampling(self) -> bool:
-        """Send sampling-stop command (sample_ctrl = 0)."""
-        return self._sampling_ctrl(0)
+        """Set work mode to Wake-Up/Standby (stop streaming)."""
+        return self._set_work_mode(proto.WorkMode.WAKE_UP)
 
     # ------------------------------------------------------------------
     # Protocol commands
@@ -102,19 +101,18 @@ class MID360Connection:
     def _next_seq(self) -> int:
         with self._lock:
             seq = self._seq
-            self._seq = (self._seq + 1) & 0xFFFF
+            self._seq = (self._seq + 1) & 0xFFFFFFFF
             return seq
 
-    def _send_cmd(self, cmd_set: int, cmd_id: int,
-                  payload: bytes = b'') -> Optional[bytes]:
-        """Send a command and wait for ACK. Returns ACK payload or None."""
-        pkt = proto.build_packet(0, self._next_seq(), cmd_set, cmd_id, payload)
+    def _send_cmd(self, cmd_id: int, data: bytes = b'') -> Optional[bytes]:
+        """Send a command and wait for ACK. Returns ACK data payload or None."""
+        pkt = proto.build_cmd_packet(cmd_id, self._next_seq(), data)
         try:
-            self._sock.sendto(pkt, (self.sensor_ip, self.cmd_port))
-            resp, addr = self._sock.recvfrom(2048)
-            hdr = proto.parse_header(resp)
-            if hdr and hdr.cmd_type == 1:  # ACK
-                return resp[proto.HEADER_SIZE:-proto.CRC16_SIZE]
+            self._cmd_sock.sendto(pkt, (self.sensor_ip, proto.PORT_COMMAND))
+            resp_raw, addr = self._cmd_sock.recvfrom(4096)
+            pkt_resp = proto.parse_cmd_packet(resp_raw)
+            if pkt_resp and pkt_resp.cmd_type == proto.CMD_TYPE_ACK:
+                return pkt_resp.data
             return None
         except socket.timeout:
             return None
@@ -124,72 +122,101 @@ class MID360Connection:
 
     def _handshake(self) -> bool:
         """
-        Handshake: tell the sensor which host IP/ports to send data to.
-        Payload = host_ip(4B) + pointcloud_port(2B) + cmd_port(2B) + imu_port(2B)
+        Register host IP/ports with the sensor via config write (cmd 0x0100).
+        Sends 3 key-value pairs: status push, point cloud, IMU destinations.
         """
         ip_bytes = socket.inet_aton(self.host_ip)
-        local_port = self._sock.getsockname()[1]
-        payload = ip_bytes + struct.pack('<HHH',
-                                         proto.PORT_POINTCLOUD,
-                                         local_port,
-                                         proto.PORT_IMU)
-        ack = self._send_cmd(proto.CmdSet.GENERAL,
-                             proto.GeneralCmdId.HANDSHAKE,
-                             payload)
+
+        # Key 0x0005: Status push destination
+        kv_push = proto.build_kv_entry(
+            proto.CfgKey.STATE_INFO_HOST_IP_CFG,
+            proto.build_host_ip_value(ip_bytes, proto.PORT_HOST_PUSH,
+                                      proto.PORT_PUSH))
+
+        # Key 0x0006: Point cloud destination
+        kv_pcl = proto.build_kv_entry(
+            proto.CfgKey.POINT_DATA_HOST_IP_CFG,
+            proto.build_host_ip_value(ip_bytes, proto.PORT_HOST_POINTCLOUD,
+                                      proto.PORT_POINTCLOUD))
+
+        # Key 0x0007: IMU destination
+        kv_imu = proto.build_kv_entry(
+            proto.CfgKey.IMU_HOST_IP_CFG,
+            proto.build_host_ip_value(ip_bytes, proto.PORT_HOST_IMU,
+                                      proto.PORT_IMU))
+
+        payload = proto.build_config_data([kv_push, kv_pcl, kv_imu])
+        ack = self._send_cmd(proto.CmdId.LIDAR_CFG_WRITE, payload)
+
         if ack is None:
             logger.warning("Handshake: no response from %s", self.sensor_ip)
             return False
-        # ACK payload: ret_code (uint8), 0=success
+
+        # ACK data: ret_code(u8) + error_key(u16)
+        if len(ack) >= 3:
+            ret_code = ack[0]
+            error_key = struct.unpack('<H', ack[1:3])[0]
+            if ret_code == 0:
+                return True
+            logger.warning("Handshake failed: ret=%d, error_key=0x%04X",
+                           ret_code, error_key)
+            return False
+
         if len(ack) >= 1 and ack[0] == 0:
             return True
-        logger.warning("Handshake failed, ret_code=%d", ack[0] if ack else -1)
         return False
 
-    def _heartbeat(self) -> bool:
-        ack = self._send_cmd(proto.CmdSet.GENERAL,
-                             proto.GeneralCmdId.HEARTBEAT)
-        return ack is not None
-
-    def _sampling_ctrl(self, start: int) -> bool:
-        payload = struct.pack('<B', start)
-        ack = self._send_cmd(proto.CmdSet.GENERAL,
-                             proto.GeneralCmdId.SAMPLING_CTRL,
-                             payload)
+    def _set_work_mode(self, mode: int) -> bool:
+        """Send work mode change via config write."""
+        kv = proto.build_kv_entry(
+            proto.CfgKey.WORK_MODE,
+            struct.pack('<B', mode))
+        payload = proto.build_config_data([kv])
+        ack = self._send_cmd(proto.CmdId.LIDAR_CFG_WRITE, payload)
         if ack is None:
             return False
         return len(ack) >= 1 and ack[0] == 0
 
     # ------------------------------------------------------------------
-    # Heartbeat thread
+    # Discovery keep-alive thread
     # ------------------------------------------------------------------
 
-    def _start_heartbeat(self):
-        self._heartbeat_stop.clear()
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop, daemon=True, name="heartbeat")
-        self._heartbeat_thread.start()
+    def _start_discovery_keepalive(self):
+        self._discovery_stop.clear()
+        self._discovery_thread = threading.Thread(
+            target=self._discovery_loop, daemon=True, name="discovery-keepalive")
+        self._discovery_thread.start()
 
-    def _heartbeat_loop(self):
-        fail_count = 0
-        while not self._heartbeat_stop.is_set():
-            if not self._heartbeat():
-                fail_count += 1
-                if fail_count >= 3:
-                    logger.error("Heartbeat lost — disconnecting")
-                    self._connected = False
-                    break
-            else:
-                fail_count = 0
-            self._heartbeat_stop.wait(HEARTBEAT_INTERVAL)
+    def _discovery_loop(self):
+        """Periodically send discovery broadcast (serves as keep-alive)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind((self.host_ip, 0))
+        except Exception:
+            logger.exception("Failed to create discovery socket")
+            return
+
+        try:
+            while not self._discovery_stop.is_set():
+                pkt = proto.build_cmd_packet(
+                    proto.CmdId.LIDAR_SEARCH, self._next_seq())
+                try:
+                    sock.sendto(pkt, ('255.255.255.255', proto.PORT_DISCOVERY))
+                except Exception:
+                    pass
+                self._discovery_stop.wait(DISCOVERY_INTERVAL)
+        finally:
+            sock.close()
 
 
 # ---------------------------------------------------------------------------
-# IP Scanner — probe a range of IPs for MID-360 devices
+# NIC enumeration
 # ---------------------------------------------------------------------------
 
 def get_local_interfaces() -> List[Tuple[str, str]]:
     """
-    Return list of (interface_name_or_ip, ip_address) for all IPv4 NICs.
+    Return list of (interface_name, ip_address) for all IPv4 NICs.
     Works on Windows and Linux.
     """
     results = []
@@ -212,6 +239,10 @@ def get_local_interfaces() -> List[Tuple[str, str]]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# IP Scanner — probe a range of IPs for MID-360 devices
+# ---------------------------------------------------------------------------
+
 def scan_mid360(host_ip: str,
                 subnet_prefix: str = "192.168.1",
                 ip_range: Tuple[int, int] = (100, 200),
@@ -219,9 +250,8 @@ def scan_mid360(host_ip: str,
                 stop_event: Optional[threading.Event] = None,
                 ) -> List[str]:
     """
-    Scan a range of IPs by sending a handshake probe.
+    Scan a range of IPs by sending a discovery probe to each.
     Returns list of IPs that responded.
-
     Uses parallel threads for speed.
     """
     found: List[str] = []
@@ -234,19 +264,22 @@ def scan_mid360(host_ip: str,
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(SCAN_TIMEOUT)
             sock.bind((host_ip, 0))
-            # Send a heartbeat as a lightweight probe
-            pkt = proto.build_packet(
-                0, 0, proto.CmdSet.GENERAL,
-                proto.GeneralCmdId.HEARTBEAT)
-            sock.sendto(pkt, (ip, proto.PORT_COMMAND))
+            # Send discovery as probe
+            pkt = proto.build_cmd_packet(
+                proto.CmdId.LIDAR_SEARCH, 0)
+            sock.sendto(pkt, (ip, proto.PORT_DISCOVERY))
             try:
                 resp, _ = sock.recvfrom(1024)
-                hdr = proto.parse_header(resp)
-                if hdr and hdr.sof == proto.FRAME_SOF:
+                pkt_resp = proto.parse_cmd_packet(resp)
+                if pkt_resp and pkt_resp.sof == proto.FRAME_SOF:
+                    # Try to parse detection data
+                    det = proto.parse_detection_data(pkt_resp.data)
+                    found_ip = det.lidar_ip if det else ip
                     with found_lock:
-                        found.append(ip)
+                        if found_ip not in found:
+                            found.append(found_ip)
                     if callback:
-                        callback(ip)
+                        callback(found_ip)
             except socket.timeout:
                 pass
             finally:
@@ -263,7 +296,7 @@ def scan_mid360(host_ip: str,
         t = threading.Thread(target=probe, args=(ip,), daemon=True)
         threads.append(t)
         t.start()
-        # Limit concurrency
+        # Limit concurrency to avoid socket exhaustion
         if len(threads) >= 20:
             for t in threads:
                 t.join(timeout=SCAN_TIMEOUT + 0.2)
