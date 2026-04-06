@@ -250,59 +250,64 @@ def scan_mid360(host_ip: str,
                 stop_event: Optional[threading.Event] = None,
                 ) -> List[str]:
     """
-    Scan a range of IPs by sending a discovery probe to each.
+    Scan for MID-360 devices using broadcast discovery.
+    Sends broadcast to 255.255.255.255:56000 and listens for responses.
+    The ip_range parameter is ignored (broadcast finds all devices).
     Returns list of IPs that responded.
-    Uses parallel threads for speed.
     """
     found: List[str] = []
     found_lock = threading.Lock()
 
-    def probe(ip: str):
-        if stop_event and stop_event.is_set():
-            return
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(SCAN_TIMEOUT)
-            sock.bind((host_ip, 0))
-            # Send discovery as probe
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.settimeout(0.5)
+        sock.bind((host_ip, 0))
+    except Exception:
+        logger.exception("Failed to create scan socket")
+        return found
+
+    try:
+        # Send multiple broadcast discovery packets
+        for attempt in range(5):
+            if stop_event and stop_event.is_set():
+                break
             pkt = proto.build_cmd_packet(
-                proto.CmdId.LIDAR_SEARCH, 0)
-            sock.sendto(pkt, (ip, proto.PORT_DISCOVERY))
+                proto.CmdId.LIDAR_SEARCH, attempt)
             try:
-                resp, _ = sock.recvfrom(1024)
-                pkt_resp = proto.parse_cmd_packet(resp)
-                if pkt_resp and pkt_resp.sof == proto.FRAME_SOF:
-                    # Try to parse detection data
-                    det = proto.parse_detection_data(pkt_resp.data)
-                    found_ip = det.lidar_ip if det else ip
-                    with found_lock:
-                        if found_ip not in found:
-                            found.append(found_ip)
-                    if callback:
-                        callback(found_ip)
-            except socket.timeout:
+                sock.sendto(pkt, ('255.255.255.255', proto.PORT_DISCOVERY))
+            except Exception:
                 pass
-            finally:
-                sock.close()
-        except Exception:
-            pass
 
-    threads = []
-    start, end = ip_range
-    for i in range(start, end + 1):
-        if stop_event and stop_event.is_set():
-            break
-        ip = f"{subnet_prefix}.{i}"
-        t = threading.Thread(target=probe, args=(ip,), daemon=True)
-        threads.append(t)
-        t.start()
-        # Limit concurrency to avoid socket exhaustion
-        if len(threads) >= 20:
-            for t in threads:
-                t.join(timeout=SCAN_TIMEOUT + 0.2)
-            threads.clear()
-
-    for t in threads:
-        t.join(timeout=SCAN_TIMEOUT + 0.2)
+            # Listen for responses
+            deadline = time.time() + 0.8
+            while time.time() < deadline:
+                if stop_event and stop_event.is_set():
+                    break
+                try:
+                    resp, addr = sock.recvfrom(4096)
+                    pkt_resp = proto.parse_cmd_packet(resp)
+                    if (pkt_resp and pkt_resp.sof == proto.FRAME_SOF
+                            and pkt_resp.cmd_type == proto.CMD_TYPE_ACK):
+                        det = proto.parse_detection_data(pkt_resp.data)
+                        if det:
+                            ip = det.lidar_ip
+                            sn = det.serial_number
+                            logger.info("Found: %s (SN=%s, type=%d)",
+                                        ip, sn, det.dev_type)
+                        else:
+                            ip = addr[0]
+                        with found_lock:
+                            if ip not in found:
+                                found.append(ip)
+                                if callback:
+                                    callback(ip)
+                except socket.timeout:
+                    break
+                except Exception:
+                    break
+    finally:
+        sock.close()
 
     return found
