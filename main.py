@@ -6,11 +6,10 @@ wiring them together with the MID-360 connection and receiver.
 """
 
 import logging
-import sys
 
 from mid360.connection import MID360Connection
 from mid360.pointcloud_receiver import PointCloudReceiver
-from mid360.viewer import PointCloudViewer
+from mid360.viewer import PointCloudViewer, ColorMode
 from gui.control_panel import ControlPanel
 
 logging.basicConfig(
@@ -20,8 +19,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Display refresh interval (ms)
 VIEWER_UPDATE_MS = 33  # ~30 fps
+
+# Map GUI label -> ColorMode enum
+_COLOR_MODE_MAP = {
+    "Height (Z)": ColorMode.HEIGHT_Z,
+    "Reflectivity": ColorMode.REFLECTIVITY,
+    "Distance": ColorMode.DISTANCE,
+}
 
 
 class App:
@@ -33,9 +38,11 @@ class App:
         self._panel = ControlPanel(
             on_connect=self._handle_connect,
             on_disconnect=self._handle_disconnect,
+            on_accum_changed=self._handle_accum_changed,
+            on_point_size_changed=self._handle_point_size_changed,
+            on_color_mode_changed=self._handle_color_mode_changed,
         )
 
-        # Start the periodic viewer update loop
         self._panel.schedule(VIEWER_UPDATE_MS, self._update_loop)
 
     # ------------------------------------------------------------------
@@ -43,7 +50,6 @@ class App:
     # ------------------------------------------------------------------
 
     def _handle_connect(self, sensor_ip: str, host_ip: str):
-        """Called from a worker thread when user clicks Connect."""
         try:
             conn = MID360Connection(sensor_ip, host_ip)
             if not conn.connect():
@@ -52,11 +58,10 @@ class App:
                 logger.error("Failed to connect to %s", sensor_ip)
                 return
 
-            # Start point cloud receiver
             receiver = PointCloudReceiver(host_ip)
+            receiver.accum_seconds = 0.5  # match GUI default
             receiver.start()
 
-            # Start sampling
             if not conn.start_sampling():
                 logger.warning("start_sampling command failed "
                                "(may already be streaming)")
@@ -64,7 +69,6 @@ class App:
             self._conn = conn
             self._receiver = receiver
 
-            # Start viewer on main thread
             self._panel.root.after(0, self._start_viewer)
             self._panel.root.after(0, lambda: self._panel.set_connected(True))
 
@@ -73,7 +77,6 @@ class App:
             self._panel.root.after(0, lambda: self._panel.set_connected(False))
 
     def _handle_disconnect(self):
-        """Called when user clicks Disconnect or closes the window."""
         if self._conn:
             try:
                 self._conn.stop_sampling()
@@ -94,6 +97,23 @@ class App:
             self._panel.set_connected(False)
 
     # ------------------------------------------------------------------
+    # Display setting callbacks
+    # ------------------------------------------------------------------
+
+    def _handle_accum_changed(self, seconds: float):
+        if self._receiver:
+            self._receiver.accum_seconds = seconds
+
+    def _handle_point_size_changed(self, size: float):
+        if self._viewer:
+            self._viewer.point_size = size
+
+    def _handle_color_mode_changed(self, mode_label: str):
+        if self._viewer:
+            mode = _COLOR_MODE_MAP.get(mode_label, ColorMode.HEIGHT_Z)
+            self._viewer.color_mode = mode
+
+    # ------------------------------------------------------------------
     # Viewer
     # ------------------------------------------------------------------
 
@@ -104,7 +124,6 @@ class App:
         self._viewer.start()
 
     def _update_loop(self):
-        """Periodic callback — update Open3D viewer and stats."""
         if self._panel.closing:
             return
 
@@ -115,21 +134,17 @@ class App:
                 self._handle_disconnect()
                 return
 
-            # Update stats in GUI
             self._panel.update_info(
                 self._receiver.fps, self._receiver.point_count)
 
         elif self._viewer and self._viewer.running:
-            # Keep Open3D alive even with no data
             if not self._viewer.update():
                 self._viewer = None
 
-        # Check if connection was lost
         if self._conn and not self._conn.connected:
             logger.warning("Connection lost")
             self._handle_disconnect()
 
-        # Reschedule
         self._panel.schedule(VIEWER_UPDATE_MS, self._update_loop)
 
     # ------------------------------------------------------------------
@@ -139,7 +154,6 @@ class App:
     def run(self):
         logger.info("MID-360 Demo starting")
         self._panel.mainloop()
-        # Cleanup on exit
         self._handle_disconnect()
         logger.info("MID-360 Demo exited")
 

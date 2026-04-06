@@ -5,6 +5,7 @@ Features:
   - NIC (network interface) selector
   - Sensor IP input + scan button
   - Connect / Disconnect
+  - Accumulation time, point size, color mode controls
   - Status display (connection state, FPS, point count)
 """
 
@@ -19,10 +20,23 @@ from mid360.connection import get_local_interfaces, scan_mid360
 
 logger = logging.getLogger(__name__)
 
-# Default subnet for MID-360
 DEFAULT_SUBNET = "192.168.1"
 DEFAULT_SCAN_START = 100
 DEFAULT_SCAN_END = 200
+
+# Accumulation time options (label -> seconds)
+ACCUM_OPTIONS = [
+    ("100 ms", 0.1),
+    ("200 ms", 0.2),
+    ("500 ms", 0.5),
+    ("1 s", 1.0),
+    ("2 s", 2.0),
+    ("5 s", 5.0),
+]
+
+POINT_SIZE_OPTIONS = ["1.0", "1.5", "2.0", "3.0", "4.0", "5.0"]
+
+COLOR_MODE_OPTIONS = ["Height (Z)", "Reflectivity", "Distance"]
 
 
 class ControlPanel:
@@ -30,14 +44,15 @@ class ControlPanel:
 
     def __init__(self,
                  on_connect: Optional[Callable[[str, str], None]] = None,
-                 on_disconnect: Optional[Callable[[], None]] = None):
-        """
-        Args:
-            on_connect: callback(sensor_ip, host_ip) when user clicks Connect
-            on_disconnect: callback() when user clicks Disconnect
-        """
+                 on_disconnect: Optional[Callable[[], None]] = None,
+                 on_accum_changed: Optional[Callable[[float], None]] = None,
+                 on_point_size_changed: Optional[Callable[[float], None]] = None,
+                 on_color_mode_changed: Optional[Callable[[str], None]] = None):
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
+        self.on_accum_changed = on_accum_changed
+        self.on_point_size_changed = on_point_size_changed
+        self.on_color_mode_changed = on_color_mode_changed
 
         self.root = tk.Tk()
         self.root.title("MID-360 Controller")
@@ -51,6 +66,13 @@ class ControlPanel:
 
         self._build_ui()
         self._refresh_interfaces()
+
+        # Fix: lock geometry after building UI so Open3D can't resize it
+        self.root.after(100, self._lock_geometry)
+
+    def _lock_geometry(self):
+        self.root.update_idletasks()
+        self.root.geometry(self.root.geometry())
 
     # ------------------------------------------------------------------
     # UI Construction
@@ -101,7 +123,7 @@ class ControlPanel:
         self._btn_scan.grid(row=row, column=3, **pad)
         row += 1
 
-        # --- Scan results / IP selection ---
+        # --- Sensor IP ---
         ttk.Label(frame, text="Sensor IP:").grid(
             row=row, column=0, sticky="w", **pad)
         self._ip_var = tk.StringVar()
@@ -124,11 +146,47 @@ class ControlPanel:
         self._btn_disconnect.pack(side="left", padx=8)
         row += 1
 
-        # --- Status ---
-        sep = ttk.Separator(frame, orient="horizontal")
-        sep.grid(row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        # --- Separator ---
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
         row += 1
 
+        # --- Display controls ---
+        ttk.Label(frame, text="Accum Time:").grid(
+            row=row, column=0, sticky="w", **pad)
+        self._accum_var = tk.StringVar(value=ACCUM_OPTIONS[2][0])  # 500ms
+        accum_combo = ttk.Combobox(
+            frame, textvariable=self._accum_var, width=10, state="readonly",
+            values=[opt[0] for opt in ACCUM_OPTIONS])
+        accum_combo.grid(row=row, column=1, sticky="w", **pad)
+        accum_combo.bind("<<ComboboxSelected>>", self._on_accum_changed)
+
+        ttk.Label(frame, text="Point Size:").grid(
+            row=row, column=2, sticky="e", **pad)
+        self._psize_var = tk.StringVar(value="1.5")
+        psize_combo = ttk.Combobox(
+            frame, textvariable=self._psize_var, width=5, state="readonly",
+            values=POINT_SIZE_OPTIONS)
+        psize_combo.grid(row=row, column=3, sticky="w", **pad)
+        psize_combo.bind("<<ComboboxSelected>>", self._on_psize_changed)
+        row += 1
+
+        ttk.Label(frame, text="Color Mode:").grid(
+            row=row, column=0, sticky="w", **pad)
+        self._color_var = tk.StringVar(value=COLOR_MODE_OPTIONS[0])
+        color_combo = ttk.Combobox(
+            frame, textvariable=self._color_var, width=15, state="readonly",
+            values=COLOR_MODE_OPTIONS)
+        color_combo.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        color_combo.bind("<<ComboboxSelected>>", self._on_color_changed)
+        row += 1
+
+        # --- Separator ---
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        row += 1
+
+        # --- Status ---
         self._status_var = tk.StringVar(value="Disconnected")
         ttk.Label(frame, text="Status:").grid(
             row=row, column=0, sticky="w", **pad)
@@ -140,6 +198,31 @@ class ControlPanel:
         self._info_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self._info_var).grid(
             row=row, column=0, columnspan=4, sticky="w", **pad)
+
+    # ------------------------------------------------------------------
+    # Display control callbacks
+    # ------------------------------------------------------------------
+
+    def _on_accum_changed(self, event):
+        label = self._accum_var.get()
+        for name, sec in ACCUM_OPTIONS:
+            if name == label:
+                if self.on_accum_changed:
+                    self.on_accum_changed(sec)
+                break
+
+    def _on_psize_changed(self, event):
+        try:
+            size = float(self._psize_var.get())
+            if self.on_point_size_changed:
+                self.on_point_size_changed(size)
+        except ValueError:
+            pass
+
+    def _on_color_changed(self, event):
+        mode = self._color_var.get()
+        if self.on_color_mode_changed:
+            self.on_color_mode_changed(mode)
 
     # ------------------------------------------------------------------
     # NIC management
@@ -158,7 +241,6 @@ class ControlPanel:
         if idx < 0 or idx >= len(self._interfaces):
             return
         _, ip = self._interfaces[idx]
-        # Auto-set subnet from selected NIC
         parts = ip.split('.')
         if len(parts) == 4:
             self._subnet_var.set('.'.join(parts[:3]))
@@ -176,7 +258,6 @@ class ControlPanel:
 
     def _on_scan(self):
         if self._scanning:
-            # Cancel ongoing scan
             self._scan_stop.set()
             return
 
@@ -248,7 +329,6 @@ class ControlPanel:
         self.root.update_idletasks()
 
         if self.on_connect:
-            # Run connection in a thread to avoid blocking GUI
             def do_connect():
                 self.on_connect(ip, host_ip)
             threading.Thread(target=do_connect, daemon=True).start()
@@ -258,7 +338,6 @@ class ControlPanel:
             self.on_disconnect()
 
     def set_connected(self, connected: bool):
-        """Called from outside to update UI state."""
         self._connected = connected
         if connected:
             self._btn_connect.configure(state="disabled")
@@ -273,7 +352,6 @@ class ControlPanel:
             self._info_var.set("")
 
     def update_info(self, fps: float, point_count: int):
-        """Update the stats display."""
         self._info_var.set(f"FPS: {fps:.1f}  |  Points: {point_count:,}")
 
     # ------------------------------------------------------------------
@@ -281,7 +359,6 @@ class ControlPanel:
     # ------------------------------------------------------------------
 
     def schedule(self, ms: int, func: Callable):
-        """Schedule a repeating callback via tkinter.after()."""
         self.root.after(ms, func)
 
     def mainloop(self):
