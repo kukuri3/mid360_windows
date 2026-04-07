@@ -47,12 +47,18 @@ class ControlPanel:
                  on_disconnect: Optional[Callable[[], None]] = None,
                  on_accum_changed: Optional[Callable[[float], None]] = None,
                  on_point_size_changed: Optional[Callable[[float], None]] = None,
-                 on_color_mode_changed: Optional[Callable[[str], None]] = None):
+                 on_color_mode_changed: Optional[Callable[[str], None]] = None,
+                 on_mode_changed: Optional[Callable[[str], None]] = None,
+                 on_save_map: Optional[Callable[[], None]] = None,
+                 on_reset_slam: Optional[Callable[[], None]] = None):
         self.on_connect = on_connect
         self.on_disconnect = on_disconnect
         self.on_accum_changed = on_accum_changed
         self.on_point_size_changed = on_point_size_changed
         self.on_color_mode_changed = on_color_mode_changed
+        self.on_mode_changed = on_mode_changed
+        self.on_save_map = on_save_map
+        self.on_reset_slam = on_reset_slam
 
         self.root = tk.Tk()
         self.root.title("MID-360 Controller")
@@ -186,6 +192,38 @@ class ControlPanel:
             row=row, column=0, columnspan=4, sticky="ew", pady=6)
         row += 1
 
+        # --- Mode (View / SLAM) ---
+        ttk.Label(frame, text="Mode:").grid(
+            row=row, column=0, sticky="w", **pad)
+        self._mode_var = tk.StringVar(value="View")
+        mode_frame = ttk.Frame(frame)
+        mode_frame.grid(row=row, column=1, columnspan=2, sticky="w", **pad)
+        ttk.Radiobutton(mode_frame, text="View", variable=self._mode_var,
+                        value="View",
+                        command=self._on_mode_changed).pack(side="left", padx=4)
+        ttk.Radiobutton(mode_frame, text="SLAM", variable=self._mode_var,
+                        value="SLAM",
+                        command=self._on_mode_changed).pack(side="left", padx=4)
+        row += 1
+
+        # --- SLAM controls ---
+        slam_frame = ttk.Frame(frame)
+        slam_frame.grid(row=row, column=0, columnspan=4, pady=4)
+        self._btn_save = ttk.Button(
+            slam_frame, text="Save Map...", command=self._on_save_map,
+            width=14, state="disabled")
+        self._btn_save.pack(side="left", padx=8)
+        self._btn_reset = ttk.Button(
+            slam_frame, text="Reset SLAM", command=self._on_reset_slam,
+            width=14, state="disabled")
+        self._btn_reset.pack(side="left", padx=8)
+        row += 1
+
+        # --- Separator ---
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=6)
+        row += 1
+
         # --- Status ---
         self._status_var = tk.StringVar(value="Disconnected")
         ttk.Label(frame, text="Status:").grid(
@@ -223,6 +261,29 @@ class ControlPanel:
         mode = self._color_var.get()
         if self.on_color_mode_changed:
             self.on_color_mode_changed(mode)
+
+    def _refresh_slam_buttons(self):
+        is_slam = (self._mode_var.get() == "SLAM")
+        state = "normal" if (is_slam and self._connected) else "disabled"
+        self._btn_save.configure(state=state)
+        self._btn_reset.configure(state=state)
+
+    def _on_mode_changed(self):
+        self._refresh_slam_buttons()
+        if self.on_mode_changed:
+            self.on_mode_changed(self._mode_var.get())
+
+    def _on_save_map(self):
+        if self.on_save_map:
+            self.on_save_map()
+
+    def _on_reset_slam(self):
+        if self.on_reset_slam:
+            self.on_reset_slam()
+
+    @property
+    def current_mode(self) -> str:
+        return self._mode_var.get()
 
     # ------------------------------------------------------------------
     # NIC management
@@ -350,9 +411,14 @@ class ControlPanel:
             self._status_var.set("Disconnected")
             self._lbl_status.configure(foreground="gray")
             self._info_var.set("")
+        # Refresh SLAM button states (without firing callback)
+        self._refresh_slam_buttons()
 
     def update_info(self, fps: float, point_count: int):
         self._info_var.set(f"FPS: {fps:.1f}  |  Points: {point_count:,}")
+
+    def update_info_text(self, text: str):
+        self._info_var.set(text)
 
     # ------------------------------------------------------------------
     # Main loop integration

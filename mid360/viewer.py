@@ -1,8 +1,9 @@
 """
 Open3D-based 3D point cloud viewer (non-blocking).
 
-Uses Open3D Visualizer with poll_events/update_renderer
-so it can coexist with tkinter's main loop.
+Supports two display modes:
+  - VIEW: live point cloud only
+  - SLAM: KISS-ICP local map + trajectory + current frame
 """
 
 import logging
@@ -21,39 +22,47 @@ class ColorMode(Enum):
     HEIGHT_Z = "Height (Z)"
 
 
+class DisplayMode(Enum):
+    VIEW = "View"
+    SLAM = "SLAM"
+
+
 class PointCloudViewer:
     """Non-blocking Open3D point cloud viewer."""
 
     def __init__(self, window_name: str = "MID-360 Point Cloud"):
         self.window_name = window_name
         self._vis: Optional[o3d.visualization.Visualizer] = None
-        self._pcd = o3d.geometry.PointCloud()
+
+        # Geometries
+        self._pcd = o3d.geometry.PointCloud()           # live frame (VIEW)
+        self._map_pcd = o3d.geometry.PointCloud()       # SLAM local map
+        self._frame_pcd = o3d.geometry.PointCloud()     # SLAM current frame
+        self._trajectory = o3d.geometry.LineSet()       # SLAM trajectory
         self._coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
             size=1.0, origin=[0, 0, 0])
-        self._geometry_added = False
+
+        self._added = {"pcd": False, "map": False, "frame": False, "traj": False}
         self._running = False
         self._point_size = 1.5
         self._color_mode = ColorMode.HEIGHT_Z
+        self._display_mode = DisplayMode.VIEW
 
     # ------------------------------------------------------------------
-    # Public API
+    # Lifecycle
     # ------------------------------------------------------------------
 
     def start(self):
-        """Create and show the Open3D window."""
         self._vis = o3d.visualization.Visualizer()
         self._vis.create_window(
             window_name=self.window_name, width=1024, height=768)
 
-        # Add coordinate axes
         self._vis.add_geometry(self._coord_frame)
 
-        # Set render options
         opt = self._vis.get_render_option()
         opt.background_color = np.array([0.05, 0.05, 0.1])
         opt.point_size = self._point_size
 
-        # Set initial viewpoint
         ctl = self._vis.get_view_control()
         ctl.set_zoom(0.3)
         ctl.set_front([0, -0.5, -1])
@@ -64,7 +73,6 @@ class PointCloudViewer:
         logger.info("Viewer started")
 
     def stop(self):
-        """Destroy the Open3D window."""
         self._running = False
         if self._vis:
             try:
@@ -72,12 +80,16 @@ class PointCloudViewer:
             except Exception:
                 pass
             self._vis = None
-        self._geometry_added = False
+        self._added = {k: False for k in self._added}
         logger.info("Viewer stopped")
 
     @property
     def running(self) -> bool:
         return self._running
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
 
     @property
     def point_size(self) -> float:
@@ -100,26 +112,110 @@ class PointCloudViewer:
     def color_mode(self, mode: ColorMode):
         self._color_mode = mode
 
+    @property
+    def display_mode(self) -> DisplayMode:
+        return self._display_mode
+
+    def set_display_mode(self, mode: DisplayMode):
+        """Switch between VIEW and SLAM display."""
+        if mode == self._display_mode:
+            return
+        self._display_mode = mode
+        # Hide geometries from the inactive mode by clearing their points
+        if mode == DisplayMode.VIEW:
+            self._clear(self._map_pcd)
+            self._clear(self._frame_pcd)
+            self._trajectory.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+            self._trajectory.lines = o3d.utility.Vector2iVector(np.zeros((0, 2), int))
+            self._refresh_geometry(self._map_pcd, "map")
+            self._refresh_geometry(self._frame_pcd, "frame")
+            self._refresh_geometry(self._trajectory, "traj")
+        else:
+            self._clear(self._pcd)
+            self._refresh_geometry(self._pcd, "pcd")
+
+    @staticmethod
+    def _clear(pcd: o3d.geometry.PointCloud):
+        pcd.points = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+        pcd.colors = o3d.utility.Vector3dVector(np.zeros((0, 3)))
+
+    # ------------------------------------------------------------------
+    # Update API — VIEW mode
+    # ------------------------------------------------------------------
+
     def update(self, xyz: Optional[np.ndarray] = None,
                reflectivity: Optional[np.ndarray] = None) -> bool:
-        """
-        Update the displayed point cloud and pump Open3D events.
-        Returns False if the window was closed.
-        """
+        """VIEW mode update + event pump."""
         if not self._vis or not self._running:
             return False
 
-        if xyz is not None and xyz.shape[0] > 0:
+        if (self._display_mode == DisplayMode.VIEW
+                and xyz is not None and xyz.shape[0] > 0):
             self._pcd.points = o3d.utility.Vector3dVector(xyz)
             colors = self._colorize(xyz, reflectivity)
             self._pcd.colors = o3d.utility.Vector3dVector(colors)
+            self._refresh_geometry(self._pcd, "pcd")
 
-            if not self._geometry_added:
-                self._vis.add_geometry(self._pcd)
-                self._geometry_added = True
+        return self._pump()
+
+    # ------------------------------------------------------------------
+    # Update API — SLAM mode
+    # ------------------------------------------------------------------
+
+    def update_slam(self,
+                    map_points: Optional[np.ndarray],
+                    current_frame: Optional[np.ndarray],
+                    trajectory: Optional[np.ndarray]) -> bool:
+        """SLAM mode update: dim local map + bright current frame + traj line."""
+        if not self._vis or not self._running:
+            return False
+
+        if self._display_mode != DisplayMode.SLAM:
+            return self._pump()
+
+        # Local map (dim)
+        if map_points is not None and len(map_points) > 0:
+            self._map_pcd.points = o3d.utility.Vector3dVector(map_points)
+            map_colors = self._colorize(map_points, None)
+            map_colors *= 0.5  # dim
+            self._map_pcd.colors = o3d.utility.Vector3dVector(map_colors)
+            self._refresh_geometry(self._map_pcd, "map")
+
+        # Current frame (bright)
+        if current_frame is not None and len(current_frame) > 0:
+            self._frame_pcd.points = o3d.utility.Vector3dVector(current_frame)
+            self._frame_pcd.paint_uniform_color([1.0, 1.0, 0.2])  # yellow
+            self._refresh_geometry(self._frame_pcd, "frame")
+
+        # Trajectory line
+        if trajectory is not None and len(trajectory) >= 2:
+            n = len(trajectory)
+            lines = np.array([[i, i + 1] for i in range(n - 1)], dtype=np.int32)
+            colors = np.tile([1.0, 0.2, 0.2], (len(lines), 1))
+            self._trajectory.points = o3d.utility.Vector3dVector(trajectory)
+            self._trajectory.lines = o3d.utility.Vector2iVector(lines)
+            self._trajectory.colors = o3d.utility.Vector3dVector(colors)
+            self._refresh_geometry(self._trajectory, "traj")
+
+        return self._pump()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _refresh_geometry(self, geom, key: str):
+        if not self._vis:
+            return
+        try:
+            if not self._added[key]:
+                self._vis.add_geometry(geom)
+                self._added[key] = True
             else:
-                self._vis.update_geometry(self._pcd)
+                self._vis.update_geometry(geom)
+        except Exception:
+            pass
 
+    def _pump(self) -> bool:
         try:
             alive = self._vis.poll_events()
             self._vis.update_renderer()
@@ -129,7 +225,6 @@ class PointCloudViewer:
         except Exception:
             self._running = False
             return False
-
         return True
 
     # ------------------------------------------------------------------

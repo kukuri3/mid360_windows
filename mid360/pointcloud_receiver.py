@@ -93,20 +93,35 @@ class PointCloudReceiver:
         with self._lock:
             now = time.time()
             cutoff = now - self._accum_sec
-            # Remove old entries
-            while self._ring and self._ring[0][0] < cutoff:
-                self._ring.popleft()
+            in_window = [e for e in self._ring if e[0] >= cutoff]
 
-            if not self._ring:
+            if not in_window:
                 return None, None
 
-            xyz_list = [entry[1] for entry in self._ring]
-            ref_list = [entry[2] for entry in self._ring]
+            xyz_list = [e[1] for e in in_window]
+            ref_list = [e[2] for e in in_window]
 
         xyz = np.concatenate(xyz_list, axis=0)
         ref = np.concatenate(ref_list, axis=0)
         self._total_points = xyz.shape[0]
         return xyz, ref
+
+    def get_scan_since(self, since_ts: float
+                       ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], float]:
+        """
+        Get all points received after a given timestamp (for SLAM scan input).
+        Returns (xyz, ref, latest_timestamp). The cursor should be updated
+        with the returned latest_timestamp.
+        """
+        with self._lock:
+            new_entries = [e for e in self._ring if e[0] > since_ts]
+            if not new_entries:
+                latest = self._ring[-1][0] if self._ring else since_ts
+                return None, None, latest
+            xyz = np.concatenate([e[1] for e in new_entries], axis=0)
+            ref = np.concatenate([e[2] for e in new_entries], axis=0)
+            latest = new_entries[-1][0]
+        return xyz, ref, latest
 
     @property
     def fps(self) -> float:
@@ -147,8 +162,10 @@ class PointCloudReceiver:
             now = time.time()
             with self._lock:
                 self._ring.append((now, xyz, ref))
-                # Prune old entries beyond 2x the accumulation window
-                cutoff = now - self._accum_sec * 2
+                # Retain at least 3 seconds (or 2x accum window) so the
+                # SLAM engine has enough history to pull scans from.
+                keep_sec = max(self._accum_sec * 2, 3.0)
+                cutoff = now - keep_sec
                 while self._ring and self._ring[0][0] < cutoff:
                     self._ring.popleft()
 
