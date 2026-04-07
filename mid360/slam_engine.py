@@ -64,10 +64,13 @@ class SlamEngine:
             return False
 
         cfg = KISSConfig()
-        # MID-360 has ~70m range; use generous bounds
+        # MID-360 has ~70m range; use generous bounds.
+        # voxel_size MUST be set explicitly (KISS-ICP doesn't auto-derive it)
         try:
             cfg.data.max_range = 70.0
             cfg.data.min_range = 0.5
+            cfg.mapping.voxel_size = 0.5            # 0.5 m voxels
+            cfg.mapping.max_points_per_voxel = 20
         except Exception:
             pass
 
